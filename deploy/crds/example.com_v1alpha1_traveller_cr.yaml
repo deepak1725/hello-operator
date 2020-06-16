@@ -5,3 +5,4 @@ metadata:
 spec:
   # Add fields here
   size: 3
+  image: paulbouwer/hello-kubernetes:1.8
