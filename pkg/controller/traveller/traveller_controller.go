@@ -5,11 +5,13 @@ import (
 
 	examplev1alpha1 "operator/hello-operator/pkg/apis/example/v1alpha1"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -101,54 +103,165 @@ func (r *ReconcileTraveller) Reconcile(request reconcile.Request) (reconcile.Res
 		return reconcile.Result{}, err
 	}
 
-	// Define a new Pod object
-	pod := newPodForCR(instance)
+	// Check if this Deployment already exists
+	found := &appsv1.Deployment{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, found)
 
-	// Set Traveller instance as the owner and controller
-	if err := controllerutil.SetControllerReference(instance, pod, r.scheme); err != nil {
-		return reconcile.Result{}, err
+	var result *reconcile.Result
+	result, err = r.ensureDeployment(request, instance, r.backendDeployment(instance))
+	if result != nil {
+		return *result, err
 	}
 
-	// Check if this Pod already exists
-	found := &corev1.Pod{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, found)
-	if err != nil && errors.IsNotFound(err) {
-		reqLogger.Info("Creating a new Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
-		err = r.client.Create(context.TODO(), pod)
-		if err != nil {
-			return reconcile.Result{}, err
-		}
-
-		// Pod created successfully - don't requeue
-		return reconcile.Result{}, nil
-	} else if err != nil {
-		return reconcile.Result{}, err
+	result, err = r.ensureService(request, instance, r.backendService(instance))
+	if result != nil {
+		return *result, err
 	}
-
-	// Pod already exists - don't requeue
-	reqLogger.Info("Skip reconcile: Pod already exists", "Pod.Namespace", found.Namespace, "Pod.Name", found.Name)
+	// Deployment and Service already exists - don't requeue
+	reqLogger.Info("Skip reconcile: Deployment and service already exists",
+		"Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
 	return reconcile.Result{}, nil
 }
 
-// newPodForCR returns a busybox pod with the same name/namespace as the cr
-func newPodForCR(cr *examplev1alpha1.Traveller) *corev1.Pod {
-	labels := map[string]string{
-		"app": cr.Name,
+func labels(v *examplev1alpha1.Traveller, tier string) map[string]string {
+	// Fetches and sets labels
+
+	return map[string]string{
+		"app":             "visitors",
+		"visitorssite_cr": v.Name,
+		"tier":            tier,
 	}
-	return &corev1.Pod{
+}
+
+func (r *ReconcileTraveller) backendService(v *examplev1alpha1.Traveller) *corev1.Service {
+	// Build a Service and deploys
+
+	labels := labels(v, "backend")
+
+	s := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-pod",
-			Namespace: cr.Namespace,
-			Labels:    labels,
+			Name:      "backend-service",
+			Namespace: v.Namespace,
 		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:    "busybox",
-					Image:   "busybox",
-					Command: []string{"sleep", "3600"},
+		Spec: corev1.ServiceSpec{
+			Selector: labels,
+			Ports: []corev1.ServicePort{{
+				Protocol:   corev1.ProtocolTCP,
+				Port:       80,
+				TargetPort: intstr.FromInt(8080),
+				NodePort:   30685,
+			}},
+			Type: corev1.ServiceTypeNodePort,
+		},
+	}
+
+	controllerutil.SetControllerReference(v, s, r.scheme)
+	return s
+}
+
+func (r *ReconcileTraveller) backendDeployment(v *examplev1alpha1.Traveller) *appsv1.Deployment {
+	// Build a Deployment
+
+	labels := labels(v, "backend")
+	size := v.Spec.Size
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hello-pod",
+			Namespace: v.Namespace,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &size,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Image:           v.Spec.Image,
+						ImagePullPolicy: corev1.PullAlways,
+						Name:            "hello-pod",
+						Ports: []corev1.ContainerPort{{
+							ContainerPort: 8080,
+							Name:          "hello",
+						}},
+					}},
 				},
 			},
 		},
 	}
+
+	controllerutil.SetControllerReference(v, dep, r.scheme)
+	return dep
+}
+
+func (r *ReconcileTraveller) ensureService(request reconcile.Request,
+	instance *examplev1alpha1.Traveller,
+	s *corev1.Service,
+) (*reconcile.Result, error) {
+
+	// See if service already exists and create if it doesn't
+	found := &appsv1.Deployment{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{
+		Name:      s.Name,
+		Namespace: instance.Namespace,
+	}, found)
+	if err != nil && errors.IsNotFound(err) {
+
+		// Create the service
+		log.Info("Creating a new Service", "Service.Namespace", s.Namespace, "Service.Name", s.Name)
+		err = r.client.Create(context.TODO(), s)
+
+		if err != nil {
+			// Service creation failed
+			log.Error(err, "Failed to create new Service", "Service.Namespace", s.Namespace, "Service.Name", s.Name)
+			return &reconcile.Result{}, err
+		} else {
+			// Service creation was successful
+			return nil, nil
+		}
+	} else if err != nil {
+		// Error that isn't due to the service not existing
+		log.Error(err, "Failed to get Service")
+		return &reconcile.Result{}, err
+	}
+
+	return nil, nil
+}
+
+func (r *ReconcileTraveller) ensureDeployment(request reconcile.Request,
+	instance *examplev1alpha1.Traveller,
+	dep *appsv1.Deployment,
+) (*reconcile.Result, error) {
+
+	// See if deployment already exists and create if it doesn't
+	found := &appsv1.Deployment{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{
+		Name:      dep.Name,
+		Namespace: instance.Namespace,
+	}, found)
+	if err != nil && errors.IsNotFound(err) {
+
+		// Create the deployment
+		log.Info("Creating a new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+		err = r.client.Create(context.TODO(), dep)
+
+		if err != nil {
+			// Deployment failed
+			log.Error(err, "Failed to create new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+			return &reconcile.Result{}, err
+		} else {
+			// Deployment was successful
+			return nil, nil
+		}
+	} else if err != nil {
+		// Error that isn't due to the deployment not existing
+		log.Error(err, "Failed to get Deployment")
+		return &reconcile.Result{}, err
+	}
+
+	return nil, nil
 }
