@@ -134,7 +134,7 @@ func labels(v *examplev1alpha1.Traveller, tier string) map[string]string {
 }
 
 func (r *ReconcileTraveller) backendService(v *examplev1alpha1.Traveller) *corev1.Service {
-	// Build a Service and deploys
+	// Build a Service
 
 	labels := labels(v, "backend")
 
